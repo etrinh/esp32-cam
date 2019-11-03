@@ -18,7 +18,7 @@
 
 #define NO_GLOBAL_ARDUINOOTA
 #include <ArduinoOTA.h>
-#include <WiFiManager.h>  // Need to patch to transfer to cpp some duplicated definitions with WebServer.h, and change HTTP_HEAD to _HTTP_HEAD
+#include <WiFiManager.h>  // Need to patch to transfer to cpp some duplicated definitions with WebServer.h, make connectWifi public and change HTTP_HEAD to _HTTP_HEAD
 #include <esp_pm.h>
 #include <esp_event_loop.h>
 #include <esp_log.h>
@@ -34,7 +34,7 @@
 #define SERIAL_DEBUG false               // Enable / Disable log - activer / désactiver le journal
 #define ESP_LOG_LEVEL ESP_LOG_VERBOSE    // ESP_LOG_NONE, ESP_LOG_VERBOSE, ESP_LOG_DEBUG, ESP_LOG_ERROR, ESP_LOG_WARM, ESP_LOG_INFO
 
-#define VERSION   "1.0"
+#define VERSION   "1.01"
 
 // Web server port - port du serveur web
 #define WEB_SERVER_PORT 80
@@ -188,6 +188,7 @@ static esp_err_t led_handler(httpd_req_t *req) {
 static esp_err_t wifi_handler(httpd_req_t *req) {
   esp_err_t res = ESP_OK;
   system_restore();
+  esp_restart();
   httpd_resp_send(req, NULL, 0);  // Response body can be empty
   return res;
 }
@@ -397,6 +398,8 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "\"ssid\":\"" + WiFi.SSID() + "\","
     "\"rssi\":\"" + String(WiFi.RSSI()) + "\","
     "\"ip\":\"" + ip2Str(WiFi.localIP()) + "\","
+    "\"mac\":\"" + WiFi.macAddress() + "\","
+    "\"chipId\":\"" + ESP_getChipId() + "\","
     "\"ota\":\"" + String(OTA?"true":"false") + "\","
     "\"otaTimer\":\"" + String(MAX(0, int((otaOnTimer - esp_timer_get_time()) / 1000000))) + "\","
     "\"reboot\":\"" + String(rebootRequested>0?"true":"false") + "\","
@@ -433,6 +436,7 @@ static esp_err_t info_handler(httpd_req_t *req) {
               "document.getElementById(\"ssid\").innerHTML = obj.ssid;"
               "document.getElementById(\"rssi\").innerHTML = obj.rssi;"
               "document.getElementById(\"ip\").innerHTML = obj.ip;"
+              "document.getElementById(\"mac\").innerHTML = obj.mac;"
               "document.getElementById(\"ledTimer\").innerHTML = obj.ledTimer>0?\" - \"+obj.ledTimer:\"\";"
               "document.getElementById(\"reboot\").innerHTML = obj.rebootTimer>0?\" - \"+obj.rebootTimer:\"\";"
               "document.getElementById(\"ota\").innerHTML = obj.ota==\"true\"?\" - On (\"+Math.round(obj.otaTimer/60)+\"min)\":\" - Off\";"
@@ -460,6 +464,8 @@ static esp_err_t info_handler(httpd_req_t *req) {
             "<span class=\"info\">RSSI: </span><span id=\"rssi\"></span>"
             "<br/>"
             "<span class=\"info\">IP: </span><span id=\"ip\"></span>"
+            "<br/>"
+            "<span class=\"info\">MAC: </span><span id=\"mac\"></span>"
           "</td>"
           "<td style=\"width: 50%;\" rowspan=\"2\">"
             "<img class=\"snapshot\" id=\"snapshot\"/>"
@@ -740,8 +746,13 @@ void setup() {
 
   // Wi-Fi connection - Connecte le module au réseau Wi-Fi
   ESP_LOGD(TAG, "Start Wi-Fi connexion ");
+  // attempt to connect; should it fail, fall back to AP
   WiFiManager wm;
-  wm.autoConnect(TAG);
+  WiFi.mode(WIFI_STA);
+  if (wm.connectWifi("", "") != WL_CONNECTED)   {
+    wm.startConfigPortal(TAG + ESP_getChipId(), "");
+    esp_restart();
+  }
   ESP_LOGD(TAG, "Wi-Fi connected ");
   
   // Start streaming web server
