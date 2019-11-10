@@ -15,7 +15,10 @@
   The above copyright notice and this permission notice shall be included in all
   copies or substantial portions of the Software.
 *********/
-
+// https://RandomNerdTutorials.com
+// https://github.com/zhouhan0126/WIFIMANAGER-ESP32 (patch require)
+// https://github.com/bartlomiejcieszkowski/Micro-RTSP/tree/bcieszko-multi-client-rtsp
+// 
 #define NO_GLOBAL_ARDUINOOTA
 #include <ArduinoOTA.h>
 #include <WiFiManager.h>  // Need to patch to transfer to cpp some duplicated definitions with WebServer.h, make connectWifi public and change HTTP_HEAD to _HTTP_HEAD
@@ -30,11 +33,14 @@
 #include "soc/soc.h"           //disable brownout problems
 #include "soc/rtc_cntl_reg.h"  //disable brownout problems
 #include "esp_http_server.h"    // API https://docs.espressif.com/projects/esp-idf/en/latest/api-reference/protocols/esp_http_server.html
+#include "CRtspSession.h"
+#include <WiFiClient.h>
 
+#define ENABLE_RTSPSERVER
 #define SERIAL_DEBUG false               // Enable / Disable log - activer / désactiver le journal
 #define ESP_LOG_LEVEL ESP_LOG_VERBOSE    // ESP_LOG_NONE, ESP_LOG_VERBOSE, ESP_LOG_DEBUG, ESP_LOG_ERROR, ESP_LOG_WARM, ESP_LOG_INFO
 
-#define VERSION   "1.01"
+#define VERSION   "1.02"
 
 // Web server port - port du serveur web
 #define WEB_SERVER_PORT 80
@@ -137,6 +143,90 @@ static const char* _UPDATE_PART = "Content-Type: text/html\r\nContent-Length: %u
 #endif
 
 httpd_handle_t stream_httpd = NULL;
+
+class BufferManager
+{
+  int m_counter = 0;
+  camera_fb_t *m_fb = NULL;
+public:
+  camera_fb_t * get()
+  {
+    if (m_counter++ == 0) {
+      m_fb = esp_camera_fb_get();
+    }
+    return m_fb;
+  }
+  void release()
+  {
+    if (--m_counter == 0) {
+      if (m_fb)
+        esp_camera_fb_return(m_fb);
+    }
+  }
+  
+} CameraBuffer;
+
+#ifdef ENABLE_RTSPSERVER
+class MyRtspServer
+{
+public:
+  MyRtspServer(u_short width, u_short height, uint16_t port = 554): m_rtspServer(port), m_streamer(width, height) { m_lastImage = millis(); m_rtspServer.setNoDelay(true); }
+  void begin() { m_rtspServer.begin(); }
+  void end() { m_rtspServer.end(); }
+  void setFrameRate(uint32_t msecPerFrame) { m_msecPerFrame = msecPerFrame; }
+  int clientCount() {
+    int count = 0;
+    LinkedListElement* element = m_streamer.getClientsListHead()->m_Next;
+    while(element != m_streamer.getClientsListHead()) {
+      ++count;
+      element = element->m_Next;
+    }
+    return count;
+  }
+  void handle()
+  {
+    if (!m_rtspServer) {
+      return;
+    }
+
+    // If we have an active client connection, just service that until gone
+    WiFiClient rtspClient = m_rtspServer.accept();
+    if(rtspClient) {
+      m_streamer.addSession(rtspClient);
+    }
+
+    // If we have an active client connection, just service that until gone
+    m_streamer.handleRequests(0); // we don't use a timeout here,
+    // instead we send only if we have new enough frames
+    uint32_t now = millis();
+    if(m_streamer.anySessions()) {
+      if(now > m_lastImage + m_msecPerFrame || now < m_lastImage) { // handle clock rollover
+        camera_fb_t * fb = CameraBuffer.get();
+        if (fb) {
+          m_streamer.setBuffer(fb);
+          m_streamer.streamImage(now);
+        }
+        CameraBuffer.release();
+        m_lastImage = now;
+      }
+    }
+  }
+protected:
+  uint32_t m_msecPerFrame = 100;
+  uint32_t m_lastImage;
+  class MyStreamer : public CStreamer
+  {
+    camera_fb_t* m_buffer = NULL;
+  public:
+    MyStreamer(u_short width, u_short height): CStreamer(width, height) {}
+    void setBuffer(camera_fb_t* buffer) { m_buffer = buffer; }
+    void streamImage(uint32_t curMsec) { if (m_buffer) { streamFrame(m_buffer->buf, m_buffer->len, curMsec); } }
+  };
+  MyStreamer m_streamer;
+  WiFiServer m_rtspServer;
+} rtspServer(1600, 1200, 554);
+#endif
+
 
 #define FLASH_PIN 4
 int64_t ledOnTimer = 0;
@@ -310,10 +400,14 @@ static esp_err_t update_handler(httpd_req_t *req) {
             footerSize = endBoundary - buf + 2 + 4/* BOUNDARY + "--\r\n\r\n" */;
           }
           else {
+            Serial.println("!startContent");
+            Serial.println(buf);
             return ESP_FAIL;
           }
         }
         else {
+          Serial.println("!endBoundary");
+          Serial.println(buf);
           return ESP_FAIL;
         }
       }
@@ -355,9 +449,18 @@ static esp_err_t update_handler(httpd_req_t *req) {
 #endif
   return res;
 }
+
+String ip2Str(IPAddress ip){
+  String s;
+  for (int i=0; i<4; i++) {
+    s += i  ? "." + String(ip[i]) : String(ip[i]);
+  }
+  return s;
+}
+
 static esp_err_t usage_handler(httpd_req_t *req) {
   esp_err_t res = ESP_OK;
-  std::string info =
+  String info =
 "<html>"
   "<head>"
     "<title>esp32-cam - API</title>"
@@ -374,19 +477,12 @@ static esp_err_t usage_handler(httpd_req_t *req) {
       "<li>Reset Wifi: " URI_WIFI "</li>"
       "<li>OTA on/off/toggle: " URI_OTA "?action=[on|off|toggle]</li>"
       "<li>Status (JSON): " URI_STATUS "</li>"
+      "<li>RTSP Streaming: rtsp://" + ip2Str(WiFi.localIP()) + "/mjpeg/1</li>"
     "</ul>"
   "</body>"
 "</html>";  
   res = httpd_resp_send(req, info.c_str(), info.length());
   return res;
-}
-
-String ip2Str(IPAddress ip){
-  String s;
-  for (int i=0; i<4; i++) {
-    s += i  ? "." + String(ip[i]) : String(ip[i]);
-  }
-  return s;
 }
 
 static esp_err_t status_handler(httpd_req_t *req) {
@@ -403,7 +499,8 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "\"ota\":\"" + String(OTA?"true":"false") + "\","
     "\"otaTimer\":\"" + String(MAX(0, int((otaOnTimer - esp_timer_get_time()) / 1000000))) + "\","
     "\"reboot\":\"" + String(rebootRequested>0?"true":"false") + "\","
-    "\"rebootTimer\":\"" + String(MAX(0, int((rebootRequested - esp_timer_get_time()) / 1000000))) + "\""
+    "\"rebootTimer\":\"" + String(MAX(0, int((rebootRequested - esp_timer_get_time()) / 1000000))) + "\","
+    "\"rtspClients\":\"" + String(rtspServer.clientCount()) + "\""
   "}";
   res = httpd_resp_set_type(req, "text/json");
   res = httpd_resp_send(req, info.c_str(), info.length());
@@ -502,40 +599,28 @@ static esp_err_t info_handler(httpd_req_t *req) {
   return res;
 }
 
-bool STREAMING = false;
 /*
    This method only stream one JPEG image - Cette méthode ne publie qu'une seule image JPEG
    Compatible with/avec Jeedom / NextDom / Domoticz
 */
 static esp_err_t capture_handler(httpd_req_t *req) {
-  if (STREAMING) {
-      httpd_resp_send_500(req);        
-      return ESP_OK;
-  }
-  STREAMING = true;
-
-  camera_fb_t *fb = NULL;
-  esp_err_t res = ESP_OK;
-  size_t fb_len = 0;
-  res = httpd_resp_set_type(req, "image/jpeg");
+  esp_err_t res = httpd_resp_set_type(req, "image/jpeg");
   if (res == ESP_OK) {
     res = httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=image.jpg");  //capture
   }
   if (res == ESP_OK) {
     ESP_LOGI(TAG, "Take a picture");
-    fb = esp_camera_fb_get();
+    camera_fb_t *fb = CameraBuffer.get();//esp_camera_fb_get();
     if (!fb)
     {
       ESP_LOGE(TAG, "Camera capture failed");
       httpd_resp_send_500(req);
       res = ESP_FAIL;
     } else {
-      fb_len = fb->len;
       res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-      esp_camera_fb_return(fb);
     }
+    CameraBuffer.release();
   }
-  STREAMING = false;
   return res;
 }
 
@@ -544,25 +629,15 @@ static esp_err_t capture_handler(httpd_req_t *req) {
    Compatible with/avec Home Assistant, HASS.IO
 */
 esp_err_t stream_handler(httpd_req_t *req) {
-  if (STREAMING) {
-      httpd_resp_send_500(req);        
-      return ESP_OK;
-  }
-  STREAMING = true;
-
-  camera_fb_t * fb = NULL;
-  esp_err_t res = ESP_OK;
-  size_t _jpg_buf_len;
-  uint8_t * _jpg_buf;
-  char part_buf[64];
-  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  esp_err_t res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
   if (res != ESP_OK) {
-    STREAMING = false;
     return res;
   }
   ESP_LOGI(TAG, "Start video streaming");
   while (true) {
-    fb = esp_camera_fb_get();
+    size_t _jpg_buf_len;
+    uint8_t * _jpg_buf;
+    camera_fb_t *fb = CameraBuffer.get(); //esp_camera_fb_get();
     if (!fb) {
       ESP_LOGE(TAG, "Camera capture failed");
       res = ESP_FAIL;
@@ -571,7 +646,6 @@ esp_err_t stream_handler(httpd_req_t *req) {
         bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
         if (!jpeg_converted) {
           ESP_LOGE(TAG, "JPEG compression failed");
-          esp_camera_fb_return(fb);
           res = ESP_FAIL;
         }
       } else {
@@ -580,6 +654,7 @@ esp_err_t stream_handler(httpd_req_t *req) {
       }
     }
     if (res == ESP_OK) {
+      char part_buf[64];
       size_t hlen = snprintf(part_buf, 64, _STREAM_PART, _jpg_buf_len);
       res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
     }
@@ -592,12 +667,12 @@ esp_err_t stream_handler(httpd_req_t *req) {
     if (fb->format != PIXFORMAT_JPEG) {
       free(_jpg_buf);
     }
-    esp_camera_fb_return(fb);
+    CameraBuffer.release();
     if (res != ESP_OK) {
       break;
     }
+    delay(100);
   }
-  STREAMING = false;
   return res;
 }
 
@@ -728,7 +803,7 @@ void setup() {
   config.pixel_format = PIXFORMAT_JPEG; //YUV422,GRAYSCALE,RGB565,JPEG
   config.frame_size = FRAMESIZE_UXGA;   //UXGA SVGA VGA QVGA Do not use sizes above QVGA when not JPEG
   config.jpeg_quality = 10;
-  config.fb_count = 2;                  //if more than one, i2s runs in continuous mode. Use only with JPEG
+  config.fb_count = 1;//2;                  //if more than one, i2s runs in continuous mode. Use only with JPEG
 
   // Camera init - Initialise la caméra
   esp_err_t err = esp_camera_init(&config);
@@ -757,11 +832,14 @@ void setup() {
   
   // Start streaming web server
   startCameraServer();
-
+  rtspServer.begin();
   ESP_LOGI(TAG, "Camera Stream Ready");
 }
 
 void loop() {
+#ifdef ENABLE_RTSPSERVER
+  rtspServer.handle();  
+#endif
   if (OTA)  OTA->handle();
   if (ledOnTimer != 0) {
     if (esp_timer_get_time() > ledOnTimer) {
@@ -779,6 +857,9 @@ void loop() {
       enableOTA(false, true);
     }
   }
-
+#ifdef ENABLE_RTSPSERVER
+  delay(rtspServer.clientCount() > 0?10:1000);
+#else
   delay(1000);
+#endif
 }
