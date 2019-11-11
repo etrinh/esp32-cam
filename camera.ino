@@ -16,7 +16,7 @@
   copies or substantial portions of the Software.
 *********/
 // https://RandomNerdTutorials.com
-// https://github.com/zhouhan0126/WIFIMANAGER-ESP32 (patch require)
+// https://github.com/zhouhan0126/WIFIMANAGER-ESP32 (patch required)
 // https://github.com/bartlomiejcieszkowski/Micro-RTSP/tree/bcieszko-multi-client-rtsp
 // 
 #define NO_GLOBAL_ARDUINOOTA
@@ -35,18 +35,24 @@
 #include "esp_http_server.h"    // API https://docs.espressif.com/projects/esp-idf/en/latest/api-reference/protocols/esp_http_server.html
 #include "CRtspSession.h"
 #include <WiFiClient.h>
+#include <EEPROM.h>
 
 #define ENABLE_RTSPSERVER
 #define SERIAL_DEBUG false               // Enable / Disable log - activer / désactiver le journal
 #define ESP_LOG_LEVEL ESP_LOG_VERBOSE    // ESP_LOG_NONE, ESP_LOG_VERBOSE, ESP_LOG_DEBUG, ESP_LOG_ERROR, ESP_LOG_WARM, ESP_LOG_INFO
 
-#define VERSION   "1.02"
+#define VERSION   "1.04"
+
+#define EEPROM_ORIENTATION_ADDRESS 0
+#define EEPROM_ORIENTATION_FLIP_MASK 0x1
+#define EEPROM_ORIENTATION_MIRROR_MASK 0x2
 
 // Web server port - port du serveur web
 #define WEB_SERVER_PORT 80
 #define URI_STATIC_JPEG "/jpg/image.jpg"
 #define URI_STREAM "/stream"
 #define URI_FLASH "/flash"
+#define URI_ORIENTATION "/orientation"
 #define URI_WIFI "/reset"
 #define URI_REBOOT "/reboot"
 #define URI_OTA "/ota"
@@ -61,9 +67,6 @@
 #define REBOOT_TIMER (3)
 #define OTA_REBOOT_TIMER (1)
 
-// Basic image Settings (compression, flip vertical orientation) - Réglages basiques de l'image (compression, inverse l'orientation verticale)
-#define FLIP_V false            // Vertical flip - inverse l'image verticalement
-#define MIRROR_H false          // Horizontal mirror - miroir horizontal
 #define IMAGE_COMPRESSION 10   //0-63 lower number means higher quality - Plus de chiffre est petit, meilleure est la qualité de l'image, plus gros est le fichier
 
 #define TAG "esp32-cam"
@@ -275,6 +278,43 @@ static esp_err_t led_handler(httpd_req_t *req) {
   return res;
 }
 
+static esp_err_t orientation_handler(httpd_req_t *req) {
+  esp_err_t res = ESP_OK;
+
+  /* Read URL query string length and allocate memory for length + 1,
+   * extra byte for null termination */
+  size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+  if (buf_len > 1) {
+    char* buf = (char*)malloc(buf_len);
+    if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+      char param[32];
+      byte val = 0;
+      /* Get value of expected key from query string */
+      if (httpd_query_key_value(buf, "mirror", param, sizeof(param)) == ESP_OK) {
+        if (strncmp(param, "1", 32) == 0 || strncmp(param, "true", 32) == 0) {
+          val |= EEPROM_ORIENTATION_MIRROR_MASK;
+        }
+      }
+      if (httpd_query_key_value(buf, "flip", param, sizeof(param)) == ESP_OK) {
+        if (strncmp(param, "1", 32) == 0 || strncmp(param, "true", 32) == 0) {
+          val |= EEPROM_ORIENTATION_FLIP_MASK;
+        }
+      }
+      byte readVal = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
+      if (readVal != val) {
+        sensor_t * s = esp_camera_sensor_get();
+        s->set_vflip(s, val & EEPROM_ORIENTATION_FLIP_MASK);
+        s->set_hmirror(s, val & EEPROM_ORIENTATION_MIRROR_MASK);
+        EEPROM.write(EEPROM_ORIENTATION_ADDRESS, val);
+        EEPROM.commit();
+      }
+    }
+    free(buf);
+  }  
+  httpd_resp_send(req, NULL, 0);  // Response body can be empty
+  return res;
+}
+
 static esp_err_t wifi_handler(httpd_req_t *req) {
   esp_err_t res = ESP_OK;
   system_restore();
@@ -357,6 +397,7 @@ static esp_err_t update_handler(httpd_req_t *req) {
   String content;
   char part_buf[64];
 
+  bool bSucceed = false;
   int footerSize = -1;
 #ifndef DEBUG_OTA
   bool canBegin = Update.begin(remaining);
@@ -421,6 +462,7 @@ static esp_err_t update_handler(httpd_req_t *req) {
 #ifndef DEBUG_OTA
     if (Update.end(true)) {
       if (Update.isFinished()) {
+        bSucceed = true;
         content = "Update successfully completed. Rebooting.";
         rebootRequested = esp_timer_get_time() + OTA_REBOOT_TIMER * 1000 * 1000;
       } else {
@@ -443,7 +485,14 @@ static esp_err_t update_handler(httpd_req_t *req) {
   res = httpd_resp_send_chunk(req, (const char *)content.c_str(), content.length());
   res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
  #endif
-  res = httpd_resp_send(req, content.c_str(), content.length());
+  String html = "<html>"
+  "<head>"
+    "<title>esp32-cam - OTA</title>" + 
+    (bSucceed?"<meta http-equiv=\"refresh\" content=\"" + String(OTA_REBOOT_TIMER + 1) + "; url=/\">":"") +
+  "</head>"
+  "<body>" + content + "</body>"
+"</html>";
+  res = httpd_resp_send(req, html.c_str(), html.length());
 #else
   httpd_resp_send_chunk(req, NULL, 0);
 #endif
@@ -471,6 +520,7 @@ static esp_err_t usage_handler(httpd_req_t *req) {
     "<h1>" TAG "<span id=\"version\"> (v" VERSION ") - API Usage</span></h1>"
     "<ul>"
       "<li>Led on/off/toggle: " URI_FLASH "?action=[on|off|toggle]</li>"
+      "<li>Flip/Mirror camera: " URI_ORIENTATION "?mirror=[0|false|1|true]&flip=[0|false|1|true]</li>"
       "<li>Snapshot JPEG: " URI_STATIC_JPEG "</li>"
       "<li>Stream MJPEG: " URI_STREAM "</li>"
       "<li>Reboot: " URI_REBOOT "</li>"
@@ -487,10 +537,13 @@ static esp_err_t usage_handler(httpd_req_t *req) {
 
 static esp_err_t status_handler(httpd_req_t *req) {
   esp_err_t res = ESP_OK;
+  byte val = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
   String info = "{"
     "\"version\":\"" VERSION "\","
     "\"led\":\"" + String(ledOnTimer?"true":"false") + "\","
     "\"ledTimer\":\"" + String(MAX(0, int((ledOnTimer - esp_timer_get_time()) / 1000000))) + "\","
+    "\"flip\":\"" + (val&(EEPROM_ORIENTATION_FLIP_MASK)?"1":"0") + "\","
+    "\"mirror\":\"" + (val&(EEPROM_ORIENTATION_MIRROR_MASK)?"1":"0") + "\","
     "\"ssid\":\"" + WiFi.SSID() + "\","
     "\"rssi\":\"" + String(WiFi.RSSI()) + "\","
     "\"ip\":\"" + ip2Str(WiFi.localIP()) + "\","
@@ -519,9 +572,7 @@ static esp_err_t info_handler(httpd_req_t *req) {
         "var xhr = new XMLHttpRequest();"
         "xhr.open(\"GET\", url, true);"
         "xhr.send(null);"
-      "};"          
-      "setInterval(function() { update(); }, 1000);"
-      "setInterval(function() { document.getElementById(\"snapshot\").src = \"" URI_STATIC_JPEG "?random=\"+new Date().getTime(); }, 3000);"
+      "};"
       "function update()"
       "{"
         "var xhr = new XMLHttpRequest();"
@@ -542,7 +593,13 @@ static esp_err_t info_handler(httpd_req_t *req) {
         "};"
         "xhr.send(null);"
       "};"
+      "function preview()"
+      "{"
+        "document.getElementById(\"snapshot\").src = \"" URI_STATIC_JPEG "?random=\"+new Date().getTime() ;"
+      "};"
       "update();"
+      "setInterval(update, 1000);"
+      "setInterval(preview, 2000);"
     "</script>"
     "<style>"
     ".snapshot {"
@@ -700,6 +757,12 @@ void startCameraServer() {
       .user_ctx  = NULL
     },
     {
+      .uri       = URI_ORIENTATION,
+      .method    = HTTP_GET,
+      .handler   = orientation_handler,
+      .user_ctx  = NULL
+    },
+    {
       .uri       = URI_WIFI,
       .method    = HTTP_GET,
       .handler   = wifi_handler,
@@ -764,6 +827,8 @@ void startCameraServer() {
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
 
+  pinMode (FLASH_PIN, OUTPUT);//back led
+
   // Stop Bluetooth
   btStop();
 
@@ -802,7 +867,7 @@ void setup() {
   config.xclk_freq_hz = 20000000;       //XCLK 20MHz or 10MHz
   config.pixel_format = PIXFORMAT_JPEG; //YUV422,GRAYSCALE,RGB565,JPEG
   config.frame_size = FRAMESIZE_UXGA;   //UXGA SVGA VGA QVGA Do not use sizes above QVGA when not JPEG
-  config.jpeg_quality = 10;
+  config.jpeg_quality = IMAGE_COMPRESSION;
   config.fb_count = 1;//2;                  //if more than one, i2s runs in continuous mode. Use only with JPEG
 
   // Camera init - Initialise la caméra
@@ -813,11 +878,16 @@ void setup() {
   } else {
     ESP_LOGD(TAG, "Camera correctly initialized ");
     sensor_t * s = esp_camera_sensor_get();
-    s->set_vflip(s, FLIP_V);
-    s->set_hmirror(s, MIRROR_H);
+    EEPROM.begin(1);
+    byte val = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
+    if (val & ~(EEPROM_ORIENTATION_FLIP_MASK|EEPROM_ORIENTATION_MIRROR_MASK)) { // Invalid content
+      val = 0; // No flip nor mirror
+      EEPROM.write(EEPROM_ORIENTATION_ADDRESS, val);
+      EEPROM.commit();
+    }
+    s->set_vflip(s, val & EEPROM_ORIENTATION_FLIP_MASK);
+    s->set_hmirror(s, val & EEPROM_ORIENTATION_MIRROR_MASK);
   }
-
-  pinMode (FLASH_PIN, OUTPUT);//back led
 
   // Wi-Fi connection - Connecte le module au réseau Wi-Fi
   ESP_LOGD(TAG, "Start Wi-Fi connexion ");
