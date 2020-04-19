@@ -41,7 +41,7 @@
 #define SERIAL_DEBUG false               // Enable / Disable log - activer / désactiver le journal
 #define ESP_LOG_LEVEL ESP_LOG_VERBOSE    // ESP_LOG_NONE, ESP_LOG_VERBOSE, ESP_LOG_DEBUG, ESP_LOG_ERROR, ESP_LOG_WARM, ESP_LOG_INFO
 
-#define VERSION   "1.04"
+#define VERSION   "1.05"
 
 #define EEPROM_ORIENTATION_ADDRESS 0
 #define EEPROM_ORIENTATION_FLIP_MASK 0x1
@@ -173,7 +173,7 @@ public:
 class MyRtspServer
 {
 public:
-  MyRtspServer(u_short width, u_short height, uint16_t port = 554): m_rtspServer(port), m_streamer(width, height) { m_lastImage = millis(); m_rtspServer.setNoDelay(true); }
+  MyRtspServer(u_short width, u_short height, uint16_t port = 554): m_streamer(width, height), m_rtspServer(port) { m_lastImage = millis(); m_rtspServer.setNoDelay(true); }
   void begin() { m_rtspServer.begin(); }
   void end() { m_rtspServer.end(); }
   void setFrameRate(uint32_t msecPerFrame) { m_msecPerFrame = msecPerFrame; }
@@ -317,7 +317,7 @@ static esp_err_t orientation_handler(httpd_req_t *req) {
 
 static esp_err_t wifi_handler(httpd_req_t *req) {
   esp_err_t res = ESP_OK;
-  system_restore();
+  esp_wifi_restore();
   esp_restart();
   httpd_resp_send(req, NULL, 0);  // Response body can be empty
   return res;
@@ -395,7 +395,9 @@ static esp_err_t update_handler(httpd_req_t *req) {
   char buf[512];
   int ret, remaining = req->content_len;
   String content;
+#ifdef PROGRESSION
   char part_buf[64];
+#endif
 
   bool bSucceed = false;
   int footerSize = -1;
@@ -817,7 +819,7 @@ void startCameraServer() {
   if (httpd_start(&stream_httpd, &config) == ESP_OK) {
     for (int i = 0; i < config.max_uri_handlers; ++i) {
       if ( httpd_register_uri_handler(stream_httpd, &handlers[i]) != ESP_OK) {
-        ESP_LOGE(TAG, "register uri failed for " + String(handlers[i].uri));
+        ESP_LOGE(TAG, "register uri failed for %s", handlers[i].uri);
         return;
       }
     }
@@ -892,12 +894,7 @@ void setup() {
   // Wi-Fi connection - Connecte le module au réseau Wi-Fi
   ESP_LOGD(TAG, "Start Wi-Fi connexion ");
   // attempt to connect; should it fail, fall back to AP
-  WiFiManager wm;
-  WiFi.mode(WIFI_STA);
-  if (wm.connectWifi("", "") != WL_CONNECTED)   {
-    wm.startConfigPortal(TAG + ESP_getChipId(), "");
-    esp_restart();
-  }
+  WiFiManager().autoConnect(TAG + ESP_getChipId(), "");
   ESP_LOGD(TAG, "Wi-Fi connected ");
   
   // Start streaming web server
