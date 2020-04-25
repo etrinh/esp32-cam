@@ -1,7 +1,4 @@
 /*********
-  projetsdiy.fr - diyprojects.io
-  Complete project details at https://RandomNerdTutorials.com
-
   IMPORTANT BEFORE TO DOWNLOAD SKETCH !!!
    - Install ESP32 libraries
    - Select Board "ESP32 Wrover Module"
@@ -32,16 +29,19 @@
 #include "fb_gfx.h"
 #include "soc/soc.h"           //disable brownout problems
 #include "soc/rtc_cntl_reg.h"  //disable brownout problems
-#include "esp_http_server.h"    // API https://docs.espressif.com/projects/esp-idf/en/latest/api-reference/protocols/esp_http_server.html
+#include <WebServer.h>
 #include "CRtspSession.h"
 #include <WiFiClient.h>
 #include <EEPROM.h>
 
-#define ENABLE_RTSPSERVER
-#define SERIAL_DEBUG false               // Enable / Disable log - activer / désactiver le journal
-#define ESP_LOG_LEVEL ESP_LOG_VERBOSE    // ESP_LOG_NONE, ESP_LOG_VERBOSE, ESP_LOG_DEBUG, ESP_LOG_ERROR, ESP_LOG_WARM, ESP_LOG_INFO
+#define MIN(a,b)  ((a)<(b)?(a):(b))
+#define MAX(a,b)  ((a)>(b)?(a):(b))
 
-#define VERSION   "1.05"
+#define ENABLE_RTSPSERVER
+#define SERIAL_DEBUG true               // Enable / Disable log - activer / désactiver le journal
+#define ESP_LOG_LEVEL ESP_LOG_NONE      // ESP_LOG_NONE, ESP_LOG_VERBOSE, ESP_LOG_DEBUG, ESP_LOG_ERROR, ESP_LOG_WARM, ESP_LOG_INFO
+
+#define VERSION   "1.06"
 
 #define EEPROM_ORIENTATION_ADDRESS 0
 #define EEPROM_ORIENTATION_FLIP_MASK 0x1
@@ -50,7 +50,6 @@
 // Web server port - port du serveur web
 #define WEB_SERVER_PORT 80
 #define URI_STATIC_JPEG "/jpg/image.jpg"
-#define URI_STREAM "/stream"
 #define URI_FLASH "/flash"
 #define URI_ORIENTATION "/orientation"
 #define URI_WIFI "/reset"
@@ -61,24 +60,18 @@
 #define URI_ROOT "/"
 #define URI_USAGE "/help"
 #define URI_INFO "/info"
+WebServer server ( WEB_SERVER_PORT );
 
 #define OTA_TIMER (10*60)
 #define FLASH_TIMER (10)
 #define REBOOT_TIMER (3)
 #define OTA_REBOOT_TIMER (1)
 
+#define WATCHDOG_TIMEOUT  (60 * 1000 * 1000)
+
 #define IMAGE_COMPRESSION 10   //0-63 lower number means higher quality - Plus de chiffre est petit, meilleure est la qualité de l'image, plus gros est le fichier
 
 #define TAG "esp32-cam"
-
-/*
-   Handler for video streaming - Entête pour le flux vidéo
-*/
-#define PART_BOUNDARY "123456789000000000000987654321"
-static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
-static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
-static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
-static const char* _UPDATE_PART = "Content-Type: text/html\r\nContent-Length: %u\r\n\r\n";
 
 // Uncomment your dev board model - Décommentez votre carte de développement
 // This project was only tested with the AI Thinker Model - le croquis a été testé uniquement avec le modèle AI Thinker
@@ -144,8 +137,6 @@ static const char* _UPDATE_PART = "Content-Type: text/html\r\nContent-Length: %u
 #else
 #error "Camera model not selected"
 #endif
-
-httpd_handle_t stream_httpd = NULL;
 
 class BufferManager
 {
@@ -249,85 +240,50 @@ static void switchLed(bool enable)
   }
 }
 
-static esp_err_t led_handler(httpd_req_t *req) {
-  esp_err_t res = ESP_OK;
-
-  /* Read URL query string length and allocate memory for length + 1,
-   * extra byte for null termination */
-  size_t buf_len = httpd_req_get_url_query_len(req) + 1;
-  if (buf_len > 1) {
-    char* buf = (char*)malloc(buf_len);
-    if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
-      char param[32];
-      /* Get value of expected key from query string */
-      if (httpd_query_key_value(buf, "action", param, sizeof(param)) == ESP_OK) {
-        if (strncmp(param, "on", 32) == 0) {
-          switchLed(true);
-        }
-        else if (strncmp(param, "off", 32) == 0) {
-          switchLed(false);
-        }
-        else if (strncmp(param, "toggle", 32) == 0) {
-          switchLed(ledOnTimer == 0);
-        }
-      }
+static void led_handler() {
+    String param = server.arg("action");
+    if (param == "on") {
+        switchLed(true);
     }
-    free(buf);
-  }  
-  httpd_resp_send(req, NULL, 0);  // Response body can be empty
-  return res;
+    else if (param == "off") {
+        switchLed(false);
+    }
+    else if (param == "toggle") {
+        switchLed(ledOnTimer == 0);
+    }
+    server.send(200);
 }
 
-static esp_err_t orientation_handler(httpd_req_t *req) {
-  esp_err_t res = ESP_OK;
-
-  /* Read URL query string length and allocate memory for length + 1,
-   * extra byte for null termination */
-  size_t buf_len = httpd_req_get_url_query_len(req) + 1;
-  if (buf_len > 1) {
-    char* buf = (char*)malloc(buf_len);
-    if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
-      char param[32];
-      byte val = 0;
-      /* Get value of expected key from query string */
-      if (httpd_query_key_value(buf, "mirror", param, sizeof(param)) == ESP_OK) {
-        if (strncmp(param, "1", 32) == 0 || strncmp(param, "true", 32) == 0) {
-          val |= EEPROM_ORIENTATION_MIRROR_MASK;
-        }
-      }
-      if (httpd_query_key_value(buf, "flip", param, sizeof(param)) == ESP_OK) {
-        if (strncmp(param, "1", 32) == 0 || strncmp(param, "true", 32) == 0) {
-          val |= EEPROM_ORIENTATION_FLIP_MASK;
-        }
-      }
-      byte readVal = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
-      if (readVal != val) {
+static void orientation_handler() {
+    byte val = 0;
+    String param = server.arg("mirror");
+    if (param == "1" || param == "true") {
+        val |= EEPROM_ORIENTATION_MIRROR_MASK;
+    }
+    param = server.arg("flip");
+    if (param == "1" || param == "true") {
+        val |= EEPROM_ORIENTATION_FLIP_MASK;
+    }
+    byte readVal = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
+    if (readVal != val) {
         sensor_t * s = esp_camera_sensor_get();
         s->set_vflip(s, val & EEPROM_ORIENTATION_FLIP_MASK);
         s->set_hmirror(s, val & EEPROM_ORIENTATION_MIRROR_MASK);
         EEPROM.write(EEPROM_ORIENTATION_ADDRESS, val);
         EEPROM.commit();
-      }
     }
-    free(buf);
-  }  
-  httpd_resp_send(req, NULL, 0);  // Response body can be empty
-  return res;
+    server.send(200);
 }
 
-static esp_err_t wifi_handler(httpd_req_t *req) {
-  esp_err_t res = ESP_OK;
-  esp_wifi_restore();
-  esp_restart();
-  httpd_resp_send(req, NULL, 0);  // Response body can be empty
-  return res;
+static void wifi_handler() {
+    esp_wifi_restore();
+    esp_restart();
+    server.send(200);
 }
 
-static esp_err_t reboot_handler(httpd_req_t *req) {
-  esp_err_t res = ESP_OK;
-  rebootRequested = esp_timer_get_time() + REBOOT_TIMER * 1000 * 1000;
-  httpd_resp_send(req, NULL, 0);  // Response body can be empty
-  return res;
+static void reboot_handler() {
+    rebootRequested = esp_timer_get_time() + REBOOT_TIMER * 1000 * 1000;
+    server.send(200);
 }
 
 ArduinoOTAClass * OTA = NULL;
@@ -358,147 +314,41 @@ static void enableOTA(bool enable, bool forceCommit = false)
   }
 }
 
-static esp_err_t ota_handler(httpd_req_t *req) {
-  esp_err_t res = ESP_OK;
-
-  /* Read URL query string length and allocate memory for length + 1,
-   * extra byte for null termination */
-  size_t buf_len = httpd_req_get_url_query_len(req) + 1;
-  if (buf_len > 1) {
-    char* buf = (char*)malloc(buf_len);
-    if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
-      char param[32];
-      /* Get value of expected key from query string */
-      if (httpd_query_key_value(buf, "action", param, sizeof(param)) == ESP_OK) {
-        if (strncmp(param, "on", 32) == 0) {
-          enableOTA(true);
-        }
-        else if (strncmp(param, "off", 32) == 0) {
-          enableOTA(false);
-        }
-        else if (strncmp(param, "toggle", 32) == 0) {
-          enableOTA(OTA==NULL);
-        }
-      }
+static void ota_handler() {
+    String param = server.arg("action");      /* Get value of expected key from query string */
+    if (param == "on") {
+        enableOTA(true);
     }
-    free(buf);
-  }  
-  res = httpd_resp_send(req, NULL, 0);
-  return res;
+    else if (param == "off") {
+        enableOTA(false);
+    }
+    else if (param == "toggle") {
+        enableOTA(OTA==NULL);
+    }
+    server.send(200);
 }
-#define MIN(a,b)  ((a)<(b)?(a):(b))
-#define MAX(a,b)  ((a)>(b)?(a):(b))
-//#define DEBUG_OTA
-//#define PROGRESSION
-static esp_err_t update_handler(httpd_req_t *req) {
-  esp_err_t res = ESP_OK;
-  char buf[512];
-  int ret, remaining = req->content_len;
-  String content;
-#ifdef PROGRESSION
-  char part_buf[64];
-#endif
 
-  bool bSucceed = false;
-  int footerSize = -1;
-#ifndef DEBUG_OTA
-  bool canBegin = Update.begin(remaining);
-#else
-  bool canBegin = true;
-#endif
-  // If yes, begin
-  if (canBegin) {
-#ifdef PROGRESSION
-    std::string progression;
-    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-#endif
-    while (remaining > 0) {
-      // Read the data for the request
-      if ((ret = httpd_req_recv(req, buf,
-                    MIN(remaining, sizeof(buf) - 1))) <= 0) {
-        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
-          // Retry receiving if timeout occurred
-          continue;
+static void update_handler() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+        Serial.setDebugOutput(true);
+        Serial.printf("Update: %s\n", upload.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
+            Update.printError(Serial);
         }
-        return ESP_FAIL;
-      }
-      remaining -= ret;
-
-#ifdef PROGRESSION
-      progression += ".\r\n";
-      size_t hlen = snprintf(part_buf, 64, _UPDATE_PART, progression.length());
-      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-      res = httpd_resp_send_chunk(req, (const char *)progression.c_str(), progression.length());
-      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-#endif
-      char* update_ptr = buf;
-      if (footerSize == -1) {
-        buf[ret] = 0;
-        char * endBoundary = strstr(buf, "\r\n");
-        if (endBoundary) {
-          char * startContent = strstr(endBoundary, "\r\n\r\n");
-          if (startContent) {
-            update_ptr = startContent + 4;
-            ret -= update_ptr - buf;
-            footerSize = endBoundary - buf + 2 + 4/* BOUNDARY + "--\r\n\r\n" */;
-          }
-          else {
-            Serial.println("!startContent");
-            Serial.println(buf);
-            return ESP_FAIL;
-          }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+            Update.printError(Serial);
         }
-        else {
-          Serial.println("!endBoundary");
-          Serial.println(buf);
-          return ESP_FAIL;
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) { //true to set the size to the current progress
+            Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+            rebootRequested = esp_timer_get_time() + REBOOT_TIMER * 1000 * 1000;
+        } else {
+            Update.printError(Serial);
         }
-      }
-#ifndef DEBUG_OTA
-      Update.write((uint8_t*)update_ptr, ret - MAX(0, footerSize - remaining));
-#elif !defined(PROGRESSION)
-      httpd_resp_send_chunk(req, update_ptr, ret - MAX(0, footerSize - remaining));
-#endif
+        Serial.setDebugOutput(false);
     }
-
-#ifndef DEBUG_OTA
-    if (Update.end(true)) {
-      if (Update.isFinished()) {
-        bSucceed = true;
-        content = "Update successfully completed. Rebooting.";
-        rebootRequested = esp_timer_get_time() + OTA_REBOOT_TIMER * 1000 * 1000;
-      } else {
-        content = "Update not finished? Something went wrong!";
-      }
-    } else {
-      content = "Error Occurred. Error #: " + String(Update.getError()) + ": " + String(Update.errorString());
-    }
-#endif
-  } else {
-    // not enough space to begin OTA
-    // Understand the partitions and
-    // space availability
-    content = "Not enough space to begin OTA";
-  }
-#ifndef DEBUG_OTA
- #ifdef PROGRESSION
-  size_t hlen = snprintf(part_buf, 64, _UPDATE_PART, content.length());
-  res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-  res = httpd_resp_send_chunk(req, (const char *)content.c_str(), content.length());
-  res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
- #endif
-  String html = "<html>"
-  "<head>"
-    "<title>esp32-cam - OTA</title>" + 
-    (bSucceed?"<meta http-equiv=\"refresh\" content=\"" + String(OTA_REBOOT_TIMER + 1) + "; url=/\">":"") +
-  "</head>"
-  "<body>" + content + "</body>"
-"</html>";
-  res = httpd_resp_send(req, html.c_str(), html.length());
-#else
-  httpd_resp_send_chunk(req, NULL, 0);
-#endif
-  return res;
 }
 
 String ip2Str(IPAddress ip){
@@ -509,9 +359,8 @@ String ip2Str(IPAddress ip){
   return s;
 }
 
-static esp_err_t usage_handler(httpd_req_t *req) {
-  esp_err_t res = ESP_OK;
-  String info =
+static void usage_handler() {
+    String info =
 "<html>"
   "<head>"
     "<title>esp32-cam - API</title>"
@@ -524,7 +373,6 @@ static esp_err_t usage_handler(httpd_req_t *req) {
       "<li>Led on/off/toggle: " URI_FLASH "?action=[on|off|toggle]</li>"
       "<li>Flip/Mirror camera: " URI_ORIENTATION "?mirror=[0|false|1|true]&flip=[0|false|1|true]</li>"
       "<li>Snapshot JPEG: " URI_STATIC_JPEG "</li>"
-      "<li>Stream MJPEG: " URI_STREAM "</li>"
       "<li>Reboot: " URI_REBOOT "</li>"
       "<li>Reset Wifi: " URI_WIFI "</li>"
       "<li>OTA on/off/toggle: " URI_OTA "?action=[on|off|toggle]</li>"
@@ -533,14 +381,12 @@ static esp_err_t usage_handler(httpd_req_t *req) {
     "</ul>"
   "</body>"
 "</html>";  
-  res = httpd_resp_send(req, info.c_str(), info.length());
-  return res;
+    server.send(200, "text/html", info);
 }
 
-static esp_err_t status_handler(httpd_req_t *req) {
-  esp_err_t res = ESP_OK;
-  byte val = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
-  String info = "{"
+static void status_handler() {
+    byte val = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
+    String info = "{"
     "\"version\":\"" VERSION "\","
     "\"led\":\"" + String(ledOnTimer?"true":"false") + "\","
     "\"ledTimer\":\"" + String(MAX(0, int((ledOnTimer - esp_timer_get_time()) / 1000000))) + "\","
@@ -557,15 +403,12 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "\"rebootTimer\":\"" + String(MAX(0, int((rebootRequested - esp_timer_get_time()) / 1000000))) + "\","
     "\"rtspClients\":\"" + String(rtspServer.clientCount()) + "\""
   "}";
-  res = httpd_resp_set_type(req, "text/json");
-  res = httpd_resp_send(req, info.c_str(), info.length());
-  return res;
+    server.send(200, "text/json", info);
 }
 
-static esp_err_t info_handler(httpd_req_t *req) {
-  esp_err_t res = ESP_OK;
-  std::string info =
-"<html>"
+static void info_handler() {
+  static const __FlashStringHelper* info =
+F("<html>"
   "<head>"
     "<title>esp32-cam</title>"
     "<script type=\"text/javascript\">"
@@ -637,8 +480,6 @@ static esp_err_t info_handler(httpd_req_t *req) {
             "<br/>"
             "<a class=\"link\" href=\"" URI_STATIC_JPEG "\">Snapshot</a>"
             "<br/>"
-            "<a class=\"link\" href=\"" URI_STREAM "\">Stream</a>"
-            "<br/>"
             "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_REBOOT "\');return false;\">Reboot Device</a><span id=\"reboot\"></span>"
             "<br/>"
             "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_WIFI "\');return false;\">Reset Device</a>"
@@ -653,280 +494,162 @@ static esp_err_t info_handler(httpd_req_t *req) {
     "</table>"
     "<a href=\"" URI_USAGE "\">API Usage</a>"
   "</body>"
-"</html>";
-  res = httpd_resp_send(req, info.c_str(), info.length());
-  return res;
+"</html>");
+    server.send(200, "text/html", info);
 }
 
 /*
    This method only stream one JPEG image - Cette méthode ne publie qu'une seule image JPEG
    Compatible with/avec Jeedom / NextDom / Domoticz
 */
-static esp_err_t capture_handler(httpd_req_t *req) {
-  esp_err_t res = httpd_resp_set_type(req, "image/jpeg");
-  if (res == ESP_OK) {
-    res = httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=image.jpg");  //capture
-  }
-  if (res == ESP_OK) {
+static void capture_handler() {
     ESP_LOGI(TAG, "Take a picture");
     camera_fb_t *fb = CameraBuffer.get();//esp_camera_fb_get();
-    if (!fb)
-    {
-      ESP_LOGE(TAG, "Camera capture failed");
-      httpd_resp_send_500(req);
-      res = ESP_FAIL;
-    } else {
-      res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-    }
-    CameraBuffer.release();
-  }
-  return res;
-}
-
-/*
-   This method stream continuously a video
-   Compatible with/avec Home Assistant, HASS.IO
-*/
-esp_err_t stream_handler(httpd_req_t *req) {
-  esp_err_t res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-  if (res != ESP_OK) {
-    return res;
-  }
-  ESP_LOGI(TAG, "Start video streaming");
-  while (true) {
-    size_t _jpg_buf_len;
-    uint8_t * _jpg_buf;
-    camera_fb_t *fb = CameraBuffer.get(); //esp_camera_fb_get();
     if (!fb) {
-      ESP_LOGE(TAG, "Camera capture failed");
-      res = ESP_FAIL;
+        ESP_LOGE(TAG, "Camera capture failed");
+        server.send(500);
     } else {
-      if (fb->format != PIXFORMAT_JPEG) {
-        bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-        if (!jpeg_converted) {
-          ESP_LOGE(TAG, "JPEG compression failed");
-          res = ESP_FAIL;
-        }
-      } else {
-        _jpg_buf_len = fb->len;
-        _jpg_buf = fb->buf;
-      }
-    }
-    if (res == ESP_OK) {
-      char part_buf[64];
-      size_t hlen = snprintf(part_buf, 64, _STREAM_PART, _jpg_buf_len);
-      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-    }
-    if (res == ESP_OK) {
-      res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
-    }
-    if (res == ESP_OK) {
-      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-    }
-    if (fb->format != PIXFORMAT_JPEG) {
-      free(_jpg_buf);
+        server.sendHeader("Content-Disposition", "inline; filename=image.jpg");
+        server.send_P(200, "image/jpeg", (const char *)fb->buf, fb->len);
     }
     CameraBuffer.release();
-    if (res != ESP_OK) {
-      break;
-    }
-    delay(100);
-  }
-  return res;
 }
 
 void startCameraServer() {
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.server_port = WEB_SERVER_PORT;
-  // endpoints
-  static const httpd_uri_t handlers[] = {
-    {
-      .uri       = URI_STATIC_JPEG,
-      .method    = HTTP_GET,
-      .handler   = capture_handler,
-      .user_ctx  = &config
-    },
-    {
-      .uri       = URI_STREAM,
-      .method    = HTTP_GET,
-      .handler   = stream_handler,
-      .user_ctx  = &config
-    },
-    {
-      .uri       = URI_FLASH,
-      .method    = HTTP_GET,
-      .handler   = led_handler,
-      .user_ctx  = NULL
-    },
-    {
-      .uri       = URI_ORIENTATION,
-      .method    = HTTP_GET,
-      .handler   = orientation_handler,
-      .user_ctx  = NULL
-    },
-    {
-      .uri       = URI_WIFI,
-      .method    = HTTP_GET,
-      .handler   = wifi_handler,
-      .user_ctx  = NULL
-    },
-    {
-      .uri       = URI_REBOOT,
-      .method    = HTTP_GET,
-      .handler   = reboot_handler,
-      .user_ctx  = NULL
-    },
-    {
-      .uri       = URI_OTA,
-      .method    = HTTP_GET,
-      .handler   = ota_handler,
-      .user_ctx  = NULL
-    },
-    {
-      .uri       = URI_UPDATE,
-      .method    = HTTP_POST,
-      .handler   = update_handler,
-      .user_ctx  = NULL
-    },
-    {
-      .uri       = URI_STATUS,
-      .method    = HTTP_GET,
-      .handler   = status_handler,
-      .user_ctx  = NULL
-    },
-    {
-      .uri       = URI_INFO,
-      .method    = HTTP_GET,
-      .handler   = info_handler,
-      .user_ctx  = NULL
-    },
-    {
-      .uri       = URI_USAGE,
-      .method    = HTTP_GET,
-      .handler   = usage_handler,
-      .user_ctx  = NULL
-    },
-    {
-      .uri       = URI_ROOT,
-      .method    = HTTP_GET,
-      .handler   = info_handler,
-      .user_ctx  = NULL
-    }
-  };
-  config.max_uri_handlers = sizeof(handlers)/sizeof(handlers[0]);
-
-  ESP_LOGI(TAG, "Register URIs and start web server");
-  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
-    for (int i = 0; i < config.max_uri_handlers; ++i) {
-      if ( httpd_register_uri_handler(stream_httpd, &handlers[i]) != ESP_OK) {
-        ESP_LOGE(TAG, "register uri failed for %s", handlers[i].uri);
-        return;
-      }
-    }
-  }
+    server.on(URI_STATIC_JPEG, capture_handler);
+    server.on(URI_FLASH, led_handler);
+    server.on(URI_ORIENTATION, orientation_handler);
+    server.on(URI_WIFI, wifi_handler);
+    server.on(URI_REBOOT, reboot_handler);
+    server.on(URI_OTA, ota_handler);
+    server.on(URI_UPDATE, HTTP_POST, []() {
+        String html = "<html>"
+                        "<head>"
+                        "<title>" TAG " - OTA</title>" +
+                        (Update.hasError() ? "<meta http-equiv=\"refresh\" content=\"" + String(OTA_REBOOT_TIMER + 1) + "; url=/\">" : "") +
+                        "</head>"
+                        "<body>Update " + (Update.hasError() ? "failed" : "succeed") + "</body>"
+                    "</html>";
+        server.sendHeader("Connection", "close");
+        server.send(200, "text/html", html);
+      }, update_handler );
+    server.on(URI_STATUS, status_handler);
+    server.on(URI_INFO, info_handler);
+    server.on(URI_USAGE, usage_handler);
+    server.on(URI_ROOT, info_handler);
+    server.begin();
 }
 
+hw_timer_t *watchdog = NULL;
+
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
+    watchdog = timerBegin(0, 80, true); //timer 0, div 80
+    timerAttachInterrupt(watchdog, &esp_restart, true);
+    timerAlarmWrite(watchdog, WATCHDOG_TIMEOUT, false); //set time in us
+    timerAlarmEnable(watchdog); //enable interrupt
 
-  pinMode (FLASH_PIN, OUTPUT);//back led
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
 
-  // Stop Bluetooth
-  btStop();
+    pinMode (FLASH_PIN, OUTPUT);//back led
 
-  // set frequency to 80Mhz
-  esp_pm_config_esp32_t pm_config;
-  pm_config.max_freq_mhz = RTC_CPU_FREQ_80M;
-  pm_config.max_freq_mhz = 80;
-  pm_config.min_freq_mhz = RTC_CPU_FREQ_80M;
-  pm_config.min_freq_mhz = 80;
-  pm_config.light_sleep_enable = false;
-  esp_pm_configure(&pm_config);
+    // Stop Bluetooth
+    btStop();
 
-  Serial.begin(115200);
-  Serial.setDebugOutput(SERIAL_DEBUG);
-  esp_log_level_set("*", ESP_LOG_LEVEL);
+    // set frequency to 80Mhz
+    esp_pm_config_esp32_t pm_config;
+    pm_config.max_freq_mhz = RTC_CPU_FREQ_80M;
+    pm_config.max_freq_mhz = 80;
+    pm_config.min_freq_mhz = RTC_CPU_FREQ_80M;
+    pm_config.min_freq_mhz = 80;
+    pm_config.light_sleep_enable = false;
+    esp_pm_configure(&pm_config);
 
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;       //XCLK 20MHz or 10MHz
-  config.pixel_format = PIXFORMAT_JPEG; //YUV422,GRAYSCALE,RGB565,JPEG
-  config.frame_size = FRAMESIZE_UXGA;   //UXGA SVGA VGA QVGA Do not use sizes above QVGA when not JPEG
-  config.jpeg_quality = IMAGE_COMPRESSION;
-  config.fb_count = 1;//2;                  //if more than one, i2s runs in continuous mode. Use only with JPEG
+    Serial.begin(115200);
+    Serial.setDebugOutput(SERIAL_DEBUG);
+    esp_log_level_set("*", ESP_LOG_LEVEL);
 
-  // Camera init - Initialise la caméra
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
-//    return;
-  } else {
-    ESP_LOGD(TAG, "Camera correctly initialized ");
-    sensor_t * s = esp_camera_sensor_get();
-    EEPROM.begin(1);
-    byte val = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
-    if (val & ~(EEPROM_ORIENTATION_FLIP_MASK|EEPROM_ORIENTATION_MIRROR_MASK)) { // Invalid content
-      val = 0; // No flip nor mirror
-      EEPROM.write(EEPROM_ORIENTATION_ADDRESS, val);
-      EEPROM.commit();
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+    config.pin_sscb_sda = SIOD_GPIO_NUM;
+    config.pin_sscb_scl = SIOC_GPIO_NUM;
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+    config.xclk_freq_hz = 20000000;       //XCLK 20MHz or 10MHz
+    config.pixel_format = PIXFORMAT_JPEG; //YUV422,GRAYSCALE,RGB565,JPEG
+    config.frame_size = FRAMESIZE_UXGA;   //UXGA SVGA VGA QVGA Do not use sizes above QVGA when not JPEG
+    config.jpeg_quality = IMAGE_COMPRESSION;
+    config.fb_count = 1;//2;                  //if more than one, i2s runs in continuous mode. Use only with JPEG
+
+    // Camera init - Initialise la caméra
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
+    //    return;
+    } else {
+        ESP_LOGD(TAG, "Camera correctly initialized ");
+        sensor_t * s = esp_camera_sensor_get();
+        EEPROM.begin(1);
+        byte val = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
+        if (val & ~(EEPROM_ORIENTATION_FLIP_MASK|EEPROM_ORIENTATION_MIRROR_MASK)) { // Invalid content
+            val = 0; // No flip nor mirror
+            EEPROM.write(EEPROM_ORIENTATION_ADDRESS, val);
+            EEPROM.commit();
+        }
+        s->set_vflip(s, val & EEPROM_ORIENTATION_FLIP_MASK);
+        s->set_hmirror(s, val & EEPROM_ORIENTATION_MIRROR_MASK);
     }
-    s->set_vflip(s, val & EEPROM_ORIENTATION_FLIP_MASK);
-    s->set_hmirror(s, val & EEPROM_ORIENTATION_MIRROR_MASK);
-  }
 
-  // Wi-Fi connection - Connecte le module au réseau Wi-Fi
-  ESP_LOGD(TAG, "Start Wi-Fi connexion ");
-  // attempt to connect; should it fail, fall back to AP
-  WiFiManager().autoConnect(TAG + ESP_getChipId(), "");
-  ESP_LOGD(TAG, "Wi-Fi connected ");
-  
-  // Start streaming web server
-  startCameraServer();
-  rtspServer.begin();
-  ESP_LOGI(TAG, "Camera Stream Ready");
+    // Wi-Fi connection - Connecte le module au réseau Wi-Fi
+    ESP_LOGD(TAG, "Start Wi-Fi connexion ");
+    // attempt to connect; should it fail, fall back to AP
+    WiFiManager().autoConnect(TAG + ESP_getChipId(), "");
+    ESP_LOGD(TAG, "Wi-Fi connected ");
+    
+    // Start streaming web server
+    startCameraServer();
+    rtspServer.begin();
+    ESP_LOGI(TAG, "Camera Stream Ready");
 }
 
 void loop() {
+    timerWrite(watchdog, 0); //reset timer (feed watchdog)
+    server.handleClient();
 #ifdef ENABLE_RTSPSERVER
-  rtspServer.handle();  
+    rtspServer.handle();  
 #endif
-  if (OTA)  OTA->handle();
-  if (ledOnTimer != 0) {
-    if (esp_timer_get_time() > ledOnTimer) {
-      switchLed(false);
+    if (OTA)  OTA->handle();
+    if (ledOnTimer != 0) {
+        if (esp_timer_get_time() > ledOnTimer) {
+            switchLed(false);
+        }
     }
-  }
-  if (rebootRequested != 0) {
-    if (esp_timer_get_time() > rebootRequested) {
-      rebootRequested = 0;
-      esp_restart();
+    if (rebootRequested != 0) {
+        if (esp_timer_get_time() > rebootRequested) {
+            rebootRequested = 0;
+            esp_restart();
+        }
     }
-  }
-  if (otaOnTimer != 0) {
-    if (esp_timer_get_time() > otaOnTimer) {
-      enableOTA(false, true);
+    if (otaOnTimer != 0) {
+        if (esp_timer_get_time() > otaOnTimer) {
+            enableOTA(false, true);
+        }
     }
-  }
 #ifdef ENABLE_RTSPSERVER
-  delay(rtspServer.clientCount() > 0?10:1000);
+    delay(rtspServer.clientCount() > 0?1:100);
 #else
-  delay(1000);
+    delay(100);
 #endif
 }
