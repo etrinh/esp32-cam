@@ -33,6 +33,7 @@
 #include "CRtspSession.h"
 #include <WiFiClient.h>
 #include <EEPROM.h>
+#include <atomic>
 
 #define MIN(a,b)  ((a)<(b)?(a):(b))
 #define MAX(a,b)  ((a)>(b)?(a):(b))
@@ -42,6 +43,8 @@
 #define ESP_LOG_LEVEL ESP_LOG_NONE      // ESP_LOG_NONE, ESP_LOG_VERBOSE, ESP_LOG_DEBUG, ESP_LOG_ERROR, ESP_LOG_WARM, ESP_LOG_INFO
 
 #define VERSION   "1.06"
+
+#define FLASH_PIN 4
 
 #define EEPROM_ORIENTATION_ADDRESS 0
 #define EEPROM_ORIENTATION_FLIP_MASK 0x1
@@ -63,13 +66,15 @@
 WebServer server ( WEB_SERVER_PORT );
 
 #define OTA_TIMER (10*60)
-#define FLASH_TIMER (10)
+#define FLASH_TIMER (60)
 #define REBOOT_TIMER (3)
 #define OTA_REBOOT_TIMER (1)
 
-#define WATCHDOG_TIMEOUT  (60 * 1000 * 1000)
+#define WATCHDOG_TIMEOUT  (2 * 60 * 1000 * 1000)
+hw_timer_t *watchdog = NULL;
 
 #define IMAGE_COMPRESSION 10   //0-63 lower number means higher quality - Plus de chiffre est petit, meilleure est la qualité de l'image, plus gros est le fichier
+#define CAMERA_SNAPSHOT_PERIOD 200
 
 #define TAG "esp32-cam"
 
@@ -138,29 +143,38 @@ WebServer server ( WEB_SERVER_PORT );
 #error "Camera model not selected"
 #endif
 
+int64_t ledOnTimer = 0;
+
 class BufferManager
 {
-  int m_counter = 0;
-  camera_fb_t *m_fb = NULL;
+    std::atomic<int> m_counter;
+    camera_fb_t *m_fb = NULL;
+    uint32_t m_lastFrame = 0;
 public:
-  camera_fb_t * get()
-  {
-    if (m_counter++ == 0) {
-      m_fb = esp_camera_fb_get();
+    BufferManager(): m_counter(0) {}
+    camera_fb_t * get()
+    {
+        uint32_t now = millis();
+        if (m_counter++ == 0 && now > m_lastFrame + CAMERA_SNAPSHOT_PERIOD) {
+            if (ledOnTimer)
+                digitalWrite(FLASH_PIN, 1);
+            if (m_fb) {
+                esp_camera_fb_return(m_fb);
+            }
+            m_fb = esp_camera_fb_get();
+            digitalWrite(FLASH_PIN, 0);
+            m_lastFrame = now;
+        }
+        return m_fb;
     }
-    return m_fb;
-  }
-  void release()
-  {
-    if (--m_counter == 0) {
-      if (m_fb)
-        esp_camera_fb_return(m_fb);
+    void release()
+    {
+        --m_counter;
     }
-  }
-  
 } CameraBuffer;
 
 #ifdef ENABLE_RTSPSERVER
+TaskHandle_t TaskRTSP;
 class MyRtspServer
 {
 public:
@@ -192,8 +206,8 @@ public:
     // If we have an active client connection, just service that until gone
     m_streamer.handleRequests(0); // we don't use a timeout here,
     // instead we send only if we have new enough frames
-    uint32_t now = millis();
     if(m_streamer.anySessions()) {
+      uint32_t now = millis();
       if(now > m_lastImage + m_msecPerFrame || now < m_lastImage) { // handle clock rollover
         camera_fb_t * fb = CameraBuffer.get();
         if (fb) {
@@ -206,7 +220,7 @@ public:
     }
   }
 protected:
-  uint32_t m_msecPerFrame = 100;
+  uint32_t m_msecPerFrame = CAMERA_SNAPSHOT_PERIOD;
   uint32_t m_lastImage;
   class MyStreamer : public CStreamer
   {
@@ -222,8 +236,6 @@ protected:
 #endif
 
 
-#define FLASH_PIN 4
-int64_t ledOnTimer = 0;
 int64_t rebootRequested = 0;
 int64_t otaOnTimer = 0;
 
@@ -232,11 +244,10 @@ static void switchLed(bool enable)
   if (enable) {
     int64_t fr_start = esp_timer_get_time();
     ledOnTimer = fr_start + FLASH_TIMER * 1000 * 1000;
-    digitalWrite(FLASH_PIN, 1);
   }
   else {
-    ledOnTimer = 0;
     digitalWrite(FLASH_PIN, 0);
+    ledOnTimer = 0;
   }
 }
 
@@ -329,39 +340,31 @@ static void ota_handler() {
 }
 
 static void update_handler() {
+    timerWrite(watchdog, 0); //reset timer (feed watchdog)
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
-        Serial.setDebugOutput(true);
-        Serial.printf("Update: %s\n", upload.filename.c_str());
+        vTaskDelete(TaskRTSP);
+        ESP_LOGI(TAG, "Update: %s\n", upload.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
-            Update.printError(Serial);
+            ESP_LOGW(TAG, "%s", Update.errorString());
         }
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-            Update.printError(Serial);
+            ESP_LOGE(TAG, "%s", Update.errorString());
         }
     } else if (upload.status == UPLOAD_FILE_END) {
         if (Update.end(true)) { //true to set the size to the current progress
-            Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
-            rebootRequested = esp_timer_get_time() + REBOOT_TIMER * 1000 * 1000;
+            ESP_LOGI(TAG, "Update Success: %u\nRebooting...\n", upload.totalSize);
+            rebootRequested = esp_timer_get_time() + 1000;
         } else {
-            Update.printError(Serial);
+            ESP_LOGE(TAG, "%s", Update.errorString());
         }
-        Serial.setDebugOutput(false);
     }
 }
 
-String ip2Str(IPAddress ip){
-  String s;
-  for (int i=0; i<4; i++) {
-    s += i  ? "." + String(ip[i]) : String(ip[i]);
-  }
-  return s;
-}
-
 static void usage_handler() {
-    String info =
-"<html>"
+    static const __FlashStringHelper* info =
+F("<html>"
   "<head>"
     "<title>esp32-cam - API</title>"
     "<style>"
@@ -377,30 +380,31 @@ static void usage_handler() {
       "<li>Reset Wifi: " URI_WIFI "</li>"
       "<li>OTA on/off/toggle: " URI_OTA "?action=[on|off|toggle]</li>"
       "<li>Status (JSON): " URI_STATUS "</li>"
-      "<li>RTSP Streaming: rtsp://" + ip2Str(WiFi.localIP()) + "/mjpeg/1</li>"
+      "<li>RTSP Streaming: rtsp://<IP>/mjpeg/1</li>"
     "</ul>"
   "</body>"
-"</html>";  
+"</html>");
     server.send(200, "text/html", info);
 }
 
 static void status_handler() {
     byte val = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
+    int64_t time = esp_timer_get_time();
     String info = "{"
     "\"version\":\"" VERSION "\","
     "\"led\":\"" + String(ledOnTimer?"true":"false") + "\","
-    "\"ledTimer\":\"" + String(MAX(0, int((ledOnTimer - esp_timer_get_time()) / 1000000))) + "\","
-    "\"flip\":\"" + (val&(EEPROM_ORIENTATION_FLIP_MASK)?"1":"0") + "\","
-    "\"mirror\":\"" + (val&(EEPROM_ORIENTATION_MIRROR_MASK)?"1":"0") + "\","
+    "\"ledTimer\":\"" + String(MAX(0, int((ledOnTimer - time) / 1000000))) + "\","
+    "\"flip\":\"" + String(val&(EEPROM_ORIENTATION_FLIP_MASK)?"1":"0") + "\","
+    "\"mirror\":\"" + String(val&(EEPROM_ORIENTATION_MIRROR_MASK)?"1":"0") + "\","
     "\"ssid\":\"" + WiFi.SSID() + "\","
     "\"rssi\":\"" + String(WiFi.RSSI()) + "\","
-    "\"ip\":\"" + ip2Str(WiFi.localIP()) + "\","
+    "\"ip\":\"" + WiFi.localIP().toString() + "\","
     "\"mac\":\"" + WiFi.macAddress() + "\","
     "\"chipId\":\"" + ESP_getChipId() + "\","
     "\"ota\":\"" + String(OTA?"true":"false") + "\","
-    "\"otaTimer\":\"" + String(MAX(0, int((otaOnTimer - esp_timer_get_time()) / 1000000))) + "\","
+    "\"otaTimer\":\"" + String(MAX(0, int((otaOnTimer - time) / 1000000))) + "\","
     "\"reboot\":\"" + String(rebootRequested>0?"true":"false") + "\","
-    "\"rebootTimer\":\"" + String(MAX(0, int((rebootRequested - esp_timer_get_time()) / 1000000))) + "\","
+    "\"rebootTimer\":\"" + String(MAX(0, int((rebootRequested - time) / 1000000))) + "\","
     "\"rtspClients\":\"" + String(rtspServer.clientCount()) + "\""
   "}";
     server.send(200, "text/json", info);
@@ -443,8 +447,8 @@ F("<html>"
         "document.getElementById(\"snapshot\").src = \"" URI_STATIC_JPEG "?random=\"+new Date().getTime() ;"
       "};"
       "update();"
-      "setInterval(update, 1000);"
-      "setInterval(preview, 2000);"
+      "setInterval(update, 2000);"
+      "setInterval(preview, 5000);"
     "</script>"
     "<style>"
     ".snapshot {"
@@ -526,9 +530,9 @@ void startCameraServer() {
         String html = "<html>"
                         "<head>"
                         "<title>" TAG " - OTA</title>" +
-                        (Update.hasError() ? "<meta http-equiv=\"refresh\" content=\"" + String(OTA_REBOOT_TIMER + 1) + "; url=/\">" : "") +
+                        String(!Update.hasError() ? "<meta http-equiv=\"refresh\" content=\"3; url=/\">" : "") +
                         "</head>"
-                        "<body>Update " + (Update.hasError() ? "failed" : "succeed") + "</body>"
+                        "<body>Update " + (Update.hasError() ? "failed" : "succeeded") + "</body>"
                     "</html>";
         server.sendHeader("Connection", "close");
         server.send(200, "text/html", html);
@@ -539,8 +543,6 @@ void startCameraServer() {
     server.on(URI_ROOT, info_handler);
     server.begin();
 }
-
-hw_timer_t *watchdog = NULL;
 
 void setup() {
     watchdog = timerBegin(0, 80, true); //timer 0, div 80
@@ -557,9 +559,7 @@ void setup() {
 
     // set frequency to 80Mhz
     esp_pm_config_esp32_t pm_config;
-    pm_config.max_freq_mhz = RTC_CPU_FREQ_80M;
     pm_config.max_freq_mhz = 80;
-    pm_config.min_freq_mhz = RTC_CPU_FREQ_80M;
     pm_config.min_freq_mhz = 80;
     pm_config.light_sleep_enable = false;
     esp_pm_configure(&pm_config);
@@ -597,7 +597,6 @@ void setup() {
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
-    //    return;
     } else {
         ESP_LOGD(TAG, "Camera correctly initialized ");
         sensor_t * s = esp_camera_sensor_get();
@@ -620,16 +619,27 @@ void setup() {
     
     // Start streaming web server
     startCameraServer();
+
+#ifdef ENABLE_RTSPSERVER
     rtspServer.begin();
     ESP_LOGI(TAG, "Camera Stream Ready");
+    xTaskCreate([](void *){
+                    for(;;){
+                        rtspServer.handle();
+                        delay(rtspServer.clientCount() > 0?100:1000);
+                    }
+                },   /* Task function. */
+                "RTSP",     /* name of task. */
+                8192,       /* Stack size of task */
+                NULL,        /* parameter of the task */
+                1,           /* priority of the task */
+                &TaskRTSP);  /* Task handle to keep track of created task */
+#endif
 }
 
 void loop() {
     timerWrite(watchdog, 0); //reset timer (feed watchdog)
     server.handleClient();
-#ifdef ENABLE_RTSPSERVER
-    rtspServer.handle();  
-#endif
     if (OTA)  OTA->handle();
     if (ledOnTimer != 0) {
         if (esp_timer_get_time() > ledOnTimer) {
@@ -647,9 +657,5 @@ void loop() {
             enableOTA(false, true);
         }
     }
-#ifdef ENABLE_RTSPSERVER
-    delay(rtspServer.clientCount() > 0?1:100);
-#else
-    delay(100);
-#endif
+    delay(10);
 }

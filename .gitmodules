@@ -3,4 +3,4 @@
 	url = https://github.com/etrinh/WIFIMANAGER-ESP32.git
 [submodule "lib/Micro-RTSP"]
 	path = lib/Micro-RTSP
-	url = https://github.com/geeksville/Micro-RTSP.git
+	url = https://github.com/etrinh/Micro-RTSP.git
