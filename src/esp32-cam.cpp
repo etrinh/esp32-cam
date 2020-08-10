@@ -380,7 +380,7 @@ F("<html>"
       "<li>Reset Wifi: " URI_WIFI "</li>"
       "<li>OTA on/off/toggle: " URI_OTA "?action=[on|off|toggle]</li>"
       "<li>Status (JSON): " URI_STATUS "</li>"
-      "<li>RTSP Streaming: rtsp://<IP>/mjpeg/1</li>"
+      "<li>RTSP Streaming: rtsp://&lt;IP&gt;/mjpeg/1</li>"
     "</ul>"
   "</body>"
 "</html>");
